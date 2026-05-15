@@ -1,0 +1,10 @@
+torch>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+tqdm>=4.65.0
+gymnasium>=0.28.0
+metaworld>=1.0.0
+octo>=0.1.0
+pyyaml>=6.0
+matplotlib>=3.7.0
+tensorboard>=2.13.0

@@ -1,221 +1,128 @@
 """
-Jacobian computation and singularity analysis for robotic manipulators.
-Supports Sawyer, Franka, and Kinova robot morphologies.
+Real Jacobian computation for Franka Panda (7-DOF) using DH parameters.
+Used by KSAM to detect kinematic singularities in real-time.
 """
 
 import torch
-import torch.nn as nn
-from typing import Dict, Optional
+import numpy as np
+from typing import Optional
+
+# Franka Emika Panda DH parameters (standard convention)
+# [a, alpha, d, theta_offset]
+PANDA_DH = torch.tensor([
+    [0.0,     -torch.pi/2, 0.333,  0.0],
+    [0.0,      torch.pi/2, 0.0,    0.0],
+    [0.0825,   torch.pi/2, 0.316,  0.0],
+    [-0.0825, -torch.pi/2, 0.0,    0.0],
+    [0.0,      torch.pi/2, 0.384,  0.0],
+    [0.088,    torch.pi/2, 0.0,    0.0],
+    [0.0,      0.0,        0.107,  0.0],
+], dtype=torch.float32)
 
 
-def compute_jacobian(joint_angles: torch.Tensor, robot_type: str = "sawyer") -> torch.Tensor:
+def forward_kinematics(q, dh_params=PANDA_DH):
     """
-    Compute the analytical Jacobian matrix for a given joint configuration.
+    Compute forward kinematics for Panda arm.
     
     Args:
-        joint_angles: Joint angles [batch_size, n_joints]
-        robot_type: Robot morphology ("sawyer", "franka", "kinova")
+        q: Joint angles [batch, 7]
+        dh_params: DH parameter table [7, 4]
     
     Returns:
-        Jacobian matrix [batch_size, 6, n_joints]
+        T_ee: End-effector pose [batch, 4, 4]
+        T_list: List of intermediate transforms [batch, 7, 4, 4]
     """
-    batch_size, n_joints = joint_angles.shape
-    
-    # Simplified DH parameter-based Jacobian computation
-    # In production, use robot-specific kinematics libraries (e.g., pinocchio, kdl)
-    
-    if robot_type == "sawyer":
-        # Sawyer: 7 DoF
-        assert n_joints == 7, f"Sawyer expects 7 joints, got {n_joints}"
-        return _compute_sawyer_jacobian(joint_angles)
-    elif robot_type == "franka":
-        # Franka Emika Panda: 7 DoF
-        assert n_joints == 7, f"Franka expects 7 joints, got {n_joints}"
-        return _compute_franka_jacobian(joint_angles)
-    elif robot_type == "kinova":
-        # Kinova Jaco: 6 or 7 DoF
-        return _compute_kinova_jacobian(joint_angles, n_joints)
-    else:
-        raise ValueError(f"Unsupported robot type: {robot_type}")
-
-
-def _compute_sawyer_jacobian(q: torch.Tensor) -> torch.Tensor:
-    """Compute Jacobian for Rethink Sawyer (7 DoF)."""
     batch_size = q.shape[0]
-    J = torch.zeros(batch_size, 6, 7, device=q.device, dtype=q.dtype)
+    device = q.device
+    dtype = q.dtype
+    dh = dh_params.to(device=device, dtype=dtype)
     
-    # Simplified kinematic model (replace with exact DH parameters)
-    # Link lengths (meters)
-    L = [0.081, 0.0, 0.364, 0.0, 0.364, 0.0, 0.107]
+    T_list = []
+    T = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1).clone()
     
-    c = torch.cos(q)
-    s = torch.sin(q)
-    
-    # Column-by-column Jacobian computation
-    # J[:, :, i] = z_i x (p_ee - p_i) for revolute joints
-    
-    # This is a simplified approximation - use exact forward kinematics in production
     for i in range(7):
-        # Angular velocity component (z-axis of joint i in base frame)
-        J[:, :3, i] = 0.0  # Simplified
+        a_i = dh[i, 0]
+        alpha_i = dh[i, 1]
+        d_i = dh[i, 2]
+        theta_i = q[:, i] + dh[i, 3]
         
-        # Linear velocity component
-        for j in range(i, 7):
-            # Accumulate contributions from distal links
-            pass
+        ct, st = torch.cos(theta_i), torch.sin(theta_i)
+        ca, sa = torch.cos(alpha_i), torch.sin(alpha_i)
+        
+        T_i = torch.zeros(batch_size, 4, 4, device=device, dtype=dtype)
+        T_i[:, 0, 0] = ct
+        T_i[:, 0, 1] = -st * ca
+        T_i[:, 0, 2] = st * sa
+        T_i[:, 0, 3] = a_i * ct
+        T_i[:, 1, 0] = st
+        T_i[:, 1, 1] = ct * ca
+        T_i[:, 1, 2] = -ct * sa
+        T_i[:, 1, 3] = a_i * st
+        T_i[:, 2, 1] = sa
+        T_i[:, 2, 2] = ca
+        T_i[:, 2, 3] = d_i
+        T_i[:, 3, 3] = 1.0
+        
+        T = torch.bmm(T, T_i)
+        T_list.append(T.clone())
     
-    # Placeholder: return identity-like structure for demonstration
-    # Replace with proper kinematic chain computation
-    J[:, 0, 0] = 1.0
-    J[:, 1, 1] = 1.0
-    J[:, 2, 2] = 1.0
-    J[:, 3, 3] = 1.0
-    J[:, 4, 4] = 1.0
-    J[:, 5, 5] = 1.0
-    J[:, 5, 6] = 0.5  # Coupling term
-    
-    return J
+    return T, T_list
 
 
-def _compute_franka_jacobian(q: torch.Tensor) -> torch.Tensor:
-    """Compute Jacobian for Franka Emika Panda (7 DoF)."""
-    batch_size = q.shape[0]
-    J = torch.zeros(batch_size, 6, 7, device=q.device, dtype=q.dtype)
-    
-    # Similar structure to Sawyer, different link parameters
-    # Placeholder implementation
-    J[:, 0, 0] = 1.0
-    J[:, 1, 1] = 1.0
-    J[:, 2, 2] = 1.0
-    J[:, 3, 3] = 1.0
-    J[:, 4, 4] = 1.0
-    J[:, 5, 5] = 1.0
-    J[:, 5, 6] = 0.3
-    
-    return J
-
-
-def _compute_kinova_jacobian(q: torch.Tensor, n_joints: int) -> torch.Tensor:
-    """Compute Jacobian for Kinova Jaco (6 or 7 DoF)."""
-    batch_size = q.shape[0]
-    J = torch.zeros(batch_size, 6, n_joints, device=q.device, dtype=q.dtype)
-    
-    # Placeholder implementation
-    for i in range(min(6, n_joints)):
-        J[:, i, i] = 1.0
-    
-    return J
-
-
-def compute_condition_number(J: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def compute_jacobian(q, dh_params=PANDA_DH):
     """
-    Compute the condition number of the Jacobian matrix.
+    Compute 6x7 geometric Jacobian for Panda arm.
     
-    κ(J) = σ_max(J) / σ_min(J)
-    
-    High condition numbers indicate proximity to kinematic singularities.
+    J_i = [z_{i-1} x (p_ee - p_{i-1}); z_{i-1}]
     
     Args:
-        J: Jacobian matrix [batch_size, 6, n_joints]
-        eps: Small constant for numerical stability
+        q: Joint angles [batch, 7]
     
     Returns:
-        Condition number [batch_size]
+        J: Geometric Jacobian [batch, 6, 7]
     """
-    # Compute singular values using SVD
-    try:
-        U, S, Vh = torch.linalg.svd(J, full_matrices=False)
-        sigma_max = S[:, 0]  # Largest singular value
-        sigma_min = S[:, -1]  # Smallest singular value
-        
-        # Avoid division by zero
-        sigma_min = torch.clamp(sigma_min, min=eps)
-        
-        kappa = sigma_max / sigma_min
-        return kappa
+    batch_size = q.shape[0]
+    device = q.device
+    dtype = q.dtype
     
-    except torch.linalg.LinAlgError:
-        # Fallback: return large value indicating singularity
-        return torch.full((J.shape[0],), 1e6, device=J.device, dtype=J.dtype)
+    T_ee, T_list = forward_kinematics(q, dh_params)
+    p_ee = T_ee[:, :3, 3]
+    
+    J = torch.zeros(batch_size, 6, 7, device=device, dtype=dtype)
+    
+    for i in range(7):
+        T_i = T_list[i]
+        z_i = T_i[:, :3, 2]
+        p_i = T_i[:, :3, 3]
+        
+        dp = p_ee - p_i
+        J[:, :3, i] = torch.cross(z_i, dp)
+        J[:, 3:6, i] = z_i
+    
+    return J
 
 
-def damped_pseudo_inverse(
-    J: torch.Tensor,
-    damping_factor: float = 0.1,
-    eps: float = 1e-6
-) -> torch.Tensor:
+def compute_condition_number(J, eps=1e-6):
     """
-    Compute the damped least-squares pseudo-inverse of the Jacobian.
-    
-    J^# = J^T (J J^T + λ²I)^{-1}
-    
-    This provides a stable inverse near singularities at the cost of accuracy.
-    
-    Args:
-        J: Jacobian matrix [batch_size, 6, n_joints]
-        damping_factor: Damping coefficient λ
-        eps: Small constant for numerical stability
-    
-    Returns:
-        Damped pseudo-inverse [batch_size, n_joints, 6]
+    Compute Jacobian condition number: kappa = sigma_max / sigma_min.
+    High kappa -> near singularity -> unsafe.
     """
-    batch_size, m, n = J.shape
-    
-    # Compute J J^T
-    JJT = torch.bmm(J, J.transpose(-2, -1))  # [batch, 6, 6]
-    
-    # Add damping: J J^T + λ²I
-    I = torch.eye(m, device=J.device, dtype=J.dtype).unsqueeze(0)  # [1, 6, 6]
-    damped_JJT = JJT + (damping_factor ** 2) * I
-    
-    # Compute inverse
-    try:
-        JJT_inv = torch.linalg.inv(damped_JJT)
-    except torch.linalg.LinAlgError:
-        # Use pseudo-inverse if inversion fails
-        JJT_inv = torch.linalg.pinv(damped_JJT)
-    
-    # J^# = J^T (J J^T + λ²I)^{-1}
-    J_dagger = torch.bmm(J.transpose(-2, -1), JJT_inv)
-    
-    return J_dagger
+    S = torch.linalg.svd(J, full_matrices=False)[1]
+    sigma_max = S[:, 0]
+    sigma_min = torch.clamp(S[:, -1], min=eps)
+    return sigma_max / sigma_min
 
 
-class KinematicSafetyLayer(nn.Module):
-    """
-    PyTorch module for kinematic safety monitoring.
-    
-    Computes condition numbers and provides safe fallback actions
-    when the robot approaches singular configurations.
-    """
-    
-    def __init__(self, robot_type: str = "sawyer", damping_factor: float = 0.1):
-        super().__init__()
-        self.robot_type = robot_type
-        self.damping_factor = damping_factor
-    
-    def forward(self, joint_angles: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass computing kinematic safety metrics.
-        
-        Args:
-            joint_angles: Joint configuration [batch_size, n_joints]
-        
-        Returns:
-            Dictionary containing:
-                - jacobian: Jacobian matrix
-                - condition_number: κ(q)
-                - damping_mask: Binary mask indicating singularity proximity
-        """
-        J = compute_jacobian(joint_angles, self.robot_type)
-        kappa = compute_condition_number(J)
-        
-        # Binary mask: 1 if near singularity (κ > threshold)
-        threshold = 100.0  # Typical threshold for industrial robots
-        damping_mask = (kappa > threshold).float()
-        
-        return {
-            "jacobian": J,
-            "condition_number": kappa,
-            "damping_mask": damping_mask,
-        }
+def compute_manipulability(J, eps=1e-6):
+    """Yoshikawa manipulability: w = sqrt(det(J @ J^T)). Low w -> near singularity."""
+    JJT = torch.bmm(J, J.transpose(-2, -1))
+    det = torch.clamp(torch.linalg.det(JJT), min=0.0)
+    return torch.sqrt(det + eps)
+
+
+def damped_pseudo_inverse(J, damping=0.1):
+    """Damped least-squares pseudo-inverse: J# = J^T (JJ^T + lambda^2 I)^{-1}"""
+    JJT = torch.bmm(J, J.transpose(-2, -1))
+    I = torch.eye(6, device=J.device, dtype=J.dtype).unsqueeze(0)
+    damped_inv = torch.linalg.inv(JJT + damping**2 * I)
+    return torch.bmm(J.transpose(-2, -1), damped_inv)

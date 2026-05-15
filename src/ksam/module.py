@@ -1,61 +1,50 @@
 """
-KSAM Wrapper Module
-Integrates kinematic singularity awareness with frozen VLA models.
+KSAM: Kinematic Singularity Awareness Module.
+Wraps any policy with Jacobian-conditioned safety gating.
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, Any, Optional
-from .jacobian import compute_jacobian, compute_condition_number, damped_pseudo_inverse
+from typing import Dict, Any, Optional, Tuple
+from .jacobian import (
+    compute_jacobian, compute_condition_number, compute_manipulability,
+    damped_pseudo_inverse, PANDA_DH
+)
 
 
 class KSAMWrapper(nn.Module):
     """
-    Kinematic Singularity Awareness Module (KSAM) wrapper for VLA models.
+    Wraps a frozen policy with kinematic singularity awareness.
     
-    This module wraps a frozen VLA model and adds a learnable gating mechanism
-    that interpolates between VLA actions and safe fallback controls when the
-    robot approaches kinematic singularities.
+    When the arm approaches a singularity (high Jacobian condition number),
+    KSAM blends the policy's action toward a damped pseudo-inverse fallback
+    that prevents joint velocity explosions.
     
-    The base VLA weights remain 100% frozen - only the gating MLP parameters
-    are trained (~4.2K parameters total).
+    Trainable params: ~4.2K (gating MLP + alpha + kappa_threshold)
     """
     
     def __init__(
         self,
-        vla_model: nn.Module,
-        robot_type: str = "sawyer",
-        damping_factor: float = 0.1,
+        policy: nn.Module,
+        action_dim: int = 4,
+        damping: float = 0.1,
         hidden_dim: int = 64,
+        device: str = "cuda",
     ):
-        """
-        Initialize KSAM wrapper.
-        
-        Args:
-            vla_model: Pretrained VLA model (weights will be frozen)
-            robot_type: Robot morphology ("sawyer", "franka", "kinova")
-            damping_factor: Damping coefficient for pseudo-inverse fallback
-            hidden_dim: Hidden dimension for gating MLP
-        """
         super().__init__()
+        self.policy = policy
+        self.action_dim = action_dim
+        self.damping = damping
+        self.device = device
         
-        # Store frozen VLA model
-        self.vla_model = vla_model
-        self.robot_type = robot_type
-        self.damping_factor = damping_factor
+        # Freeze base policy
+        for p in self.policy.parameters():
+            p.requires_grad = False
+        self.policy.eval()
         
-        # Freeze VLA parameters
-        for param in self.vla_model.parameters():
-            param.requires_grad = False
-        self.vla_model.eval()
-        
-        # Determine number of joints based on robot type
-        self.n_joints = 7 if robot_type in ["sawyer", "franka"] else 6
-        
-        # Gating MLP: joint angles -> gating scalar
-        # Architecture: [n_joints] -> [hidden_dim] -> [hidden_dim] -> [1]
+        # Gating MLP: joint_angles -> gate scalar
         self.gate_mlp = nn.Sequential(
-            nn.Linear(self.n_joints, hidden_dim),
+            nn.Linear(7, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -63,100 +52,86 @@ class KSAMWrapper(nn.Module):
             nn.Sigmoid(),
         )
         
-        # Learnable parameters for gating function
-        self.alpha = nn.Parameter(torch.tensor(5.0))  # Steepness
-        self.kappa_threshold = nn.Parameter(torch.tensor(100.0))  # Singularity threshold
-        
-        # Action dimension (will be inferred from VLA output)
-        self.action_dim = None
+        # Learnable singularity threshold and steepness
+        self.alpha = nn.Parameter(torch.tensor(5.0))
+        self.kappa_threshold = nn.Parameter(torch.tensor(50.0))
     
     def forward(
         self,
-        observation: Dict[str, Any],
-        return_debug_info: bool = False,
-    ) -> torch.Tensor:
+        joint_angles: torch.Tensor,
+        observation: Optional[Dict] = None,
+        return_debug: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Dict]]:
         """
-        Forward pass through KSAM-wrapped VLA.
-        
         Args:
-            observation: Dictionary containing:
-                - "image": Visual input [B, H, W, C] or [B, C, H, W]
-                - "language": Language embedding [B, seq_len, dim]
-                - "proprioception": Proprioceptive state
-                    - "joint_angles": Joint configuration [B, n_joints]
-                    - "end_effector_pos": End-effector position [B, 3] (optional)
-            return_debug_info: If True, return additional debug information
+            joint_angles: [batch, 7] joint configuration
+            observation: dict for base policy (images, etc.)
         
         Returns:
-            action: Safe action tensor [B, action_dim]
-            debug_info (optional): Dictionary with intermediate values
+            action: [batch, action_dim] safe action
+            debug_info: optional dict with kappa, gate, etc.
         """
-        # Extract proprioception
-        proprio = observation["proprioception"]
-        joint_angles = proprio["joint_angles"]  # [B, n_joints]
-        
         batch_size = joint_angles.shape[0]
         
-        # Step 1: Compute Jacobian and condition number
-        J = compute_jacobian(joint_angles, self.robot_type)  # [B, 6, n_joints]
+        # 1. Compute Jacobian and condition number
+        J = compute_jacobian(joint_angles)  # [B, 6, 7]
         kappa = compute_condition_number(J)  # [B]
+        manip = compute_manipulability(J)    # [B]
         
-        # Step 2: Compute gating signal
-        # g = σ(α * (κ_threshold - κ(q)))
-        gate_input = self.alpha * (self.kappa_threshold - kappa)  # [B]
-        gate_mlp_output = self.gate_mlp(joint_angles).squeeze(-1)  # [B]
+        # 2. Gating signal
+        gate_condition = torch.sigmoid(
+            self.alpha * (self.kappa_threshold - kappa)
+        )  # [B]
+        gate_mlp = self.gate_mlp(joint_angles).squeeze(-1)  # [B]
+        gate = (gate_condition * gate_mlp).clamp(0.0, 1.0)  # [B]
         
-        # Combine learned gate with condition-based modulation
-        g = torch.sigmoid(gate_input) * gate_mlp_output  # [B]
-        g = g.clamp(0.0, 1.0)  # Ensure valid range
-        
-        # Step 3: Get VLA action (frozen backbone)
+        # 3. Base policy action (frozen)
         with torch.no_grad():
-            vla_action = self.vla_model(observation)  # [B, action_dim]
+            if observation is not None:
+                vla_action = self.policy(observation)
+            else:
+                vla_action = self.policy(joint_angles)
         
-        if self.action_dim is None:
-            self.action_dim = vla_action.shape[-1]
+        # Ensure action_dim match
+        if vla_action.shape[-1] < self.action_dim:
+            pad = torch.zeros(batch_size, self.action_dim - vla_action.shape[-1],
+                            device=vla_action.device, dtype=vla_action.dtype)
+            vla_action = torch.cat([vla_action, pad], dim=-1)
+        vla_action = vla_action[:, :self.action_dim]
         
-        # Step 4: Compute safe fallback action using damped pseudo-inverse
-        # For demonstration: use damped IK to track desired end-effector velocity
-        # In practice, this could be a simple damping controller or impedance control
+        # 4. Safe fallback via damped pseudo-inverse
+        # Map task-space action through J to get safe joint velocities, then back
+        J_pinv = damped_pseudo_inverse(J, self.damping)  # [B, 7, 6]
         
-        # Extract desired end-effector velocity from VLA action
-        # Assuming action format: [vx, vy, vz, wx, wy, wz, gripper]
-        ee_vel_cmd = vla_action[:, :6]  # [B, 6]
+        # Assume first 3 dims of action are Cartesian velocity
+        ee_cmd = vla_action[:, :3].unsqueeze(-1)  # [B, 3, 1]
+        # Pad to 6D for full spatial velocity
+        ee_cmd_6d = torch.zeros(batch_size, 6, 1, device=vla_action.device, dtype=vla_action.dtype)
+        ee_cmd_6d[:, :3] = ee_cmd
         
-        # Compute joint velocities via damped pseudo-inverse
-        J_dagger = damped_pseudo_inverse(J, self.damping_factor)  # [B, n_joints, 6]
-        joint_vel_safe = torch.bmm(J_dagger, ee_vel_cmd.unsqueeze(-1)).squeeze(-1)  # [B, n_joints]
+        joint_vel = torch.bmm(J_pinv, ee_cmd_6d).squeeze(-1)  # [B, 7]
+        ee_vel_safe = torch.bmm(J, joint_vel.unsqueeze(-1)).squeeze(-1)[:, :3]  # [B, 3]
         
-        # Convert joint velocities back to task space for consistent action format
-        # This ensures a_safe has the same format as a_VLA
-        ee_vel_safe = torch.bmm(J, joint_vel_safe.unsqueeze(-1)).squeeze(-1)  # [B, 6]
+        # 5. Blend: a_final = g * a_vla + (1-g) * a_safe
+        safe_action = vla_action.clone()
+        g = gate.unsqueeze(-1)
+        safe_action[:, :3] = g * vla_action[:, :3] + (1 - g) * ee_vel_safe
         
-        # Construct safe action (preserve gripper command from VLA)
-        safe_action = torch.cat([ee_vel_safe, vla_action[:, 6:]], dim=-1)  # [B, action_dim]
-        
-        # Step 5: Blend VLA action and safe action
-        # a_final = g * a_VLA + (1 - g) * a_safe
-        g_expanded = g.unsqueeze(-1).expand_as(vla_action)  # [B, action_dim]
-        final_action = g_expanded * vla_action + (1.0 - g_expanded) * safe_action
-        
-        if return_debug_info:
-            debug_info = {
-                "condition_number": kappa,
-                "gate_value": g,
+        if return_debug:
+            return safe_action, {
+                "kappa": kappa,
+                "manipulability": manip,
+                "gate": gate,
+                "gate_condition": gate_condition,
+                "gate_mlp": gate_mlp,
                 "vla_action": vla_action,
                 "safe_action": safe_action,
                 "is_near_singularity": kappa > self.kappa_threshold.item(),
             }
-            return final_action, debug_info
-        
-        return final_action
+        return safe_action, None
     
-    def get_num_trainable_params(self) -> int:
-        """Return the number of trainable parameters (excluding frozen VLA)."""
+    def trainable_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
-    def get_total_params(self) -> int:
-        """Return total parameter count including frozen VLA."""
+    def total_params(self):
         return sum(p.numel() for p in self.parameters())
